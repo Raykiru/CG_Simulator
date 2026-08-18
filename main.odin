@@ -1,7 +1,11 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
+import "core:math"
 import "core:math/rand"
+import "core:slice"
+import "core:sort"
 import "core:strings"
 import rl "vendor:raylib"
 
@@ -11,15 +15,19 @@ MAX_ENTITIES :: 1024
 CARD_SIZE :: [2]f32{121, 170}
 PLAYER_HAND_SIZE :: [2]f32{10 * CARD_SIZE.x, CARD_SIZE.y}
 
-// Types
+Thing_types :: enum {
+	None,
+	Mouse,
+	Rectangle,
+}
+// @Types
 Thing_traits :: enum {
-	Rectangular,
 	Textured,
 	Flippable,
 	Static,
 	Capturable,
 	Capturing,
-	Is_Mouse,
+	Gage_like,
 }
 Thing_tags :: enum {
 	Deleted,
@@ -27,10 +35,14 @@ Thing_tags :: enum {
 	Highlighted,
 	Hidden,
 }
-Thing_idx :: int // index into things array, not gen
+Thing_handle :: struct {
+	idx: int,
+	gen: int,
+}
 Thing :: struct {
 	// generic fields
 	gen:              int,
+	type:             Thing_types,
 	pos, size, pivot: rl.Vector2,
 	angle:            f32,
 	color:            rl.Color,
@@ -46,17 +58,20 @@ Thing :: struct {
 	back_texture:     rl.Texture,
 	flipped:          bool,
 
-	//	// Capturable
-	parent_id:        Thing_idx,
-
 	//	//Static
 
+	//	// Capturable
+	parent_handle:    Thing_handle,
+
 	//	// Capturing
-	captures:         [dynamic]Thing_idx,
+	captures:         [dynamic]Thing_handle,
+
+	//	// Gage-like
+	gage_zone:        rl.Rectangle,
 }
 
 
-// Global state
+// @Global state
 input: struct {
 	left_click, right_click, left_hold, r_click, f_click, space_click: bool,
 	mouse_pos, vmouse_pos, mouse_delta:                                rl.Vector2,
@@ -64,16 +79,44 @@ input: struct {
 	num_click:                                                         bool,
 }
 things: [dynamic; MAX_ENTITIES]Thing
+gen_source := 0
+mouse_thing_handle: Thing_handle
 
-// global data
+// @assets
 card_images := #load_directory("./playing-cards/")
 loaded_textures: [dynamic]rl.Texture
 back_texture: rl.Texture
-gen_source := 0
 
-mouse_thing_id: Thing_idx
+// @helper functions
+ordered_remove_sorted_indexes_dynamic_array :: #force_inline proc(
+	#no_alias arr: ^$T/[dynamic]$E,
+	sorted_ids: []int,
+	loc := #caller_location,
+) #no_bounds_check {
+	progress := 0
+	initial_len := len(arr)
 
-// helper functions
+	assert(slice.is_sorted(sorted_ids), loc = loc)
+	assert(sorted_ids[len(sorted_ids) - 1] < len(arr), loc = loc)
+	assert(sorted_ids[0] >= 0, loc = loc)
+
+	for el, el_i in arr {
+		// assure no duplicates
+		// calculate how far back the empty slot is
+		if el_i - 1 == sorted_ids[progress] {
+			progress += 1
+			assert(sorted_ids[progress] != sorted_ids[progress + 1])
+		}
+
+		// pull back the element to the now empty slot
+		arr[el_i - progress] = el
+	}
+	// handle removing last element
+	if sorted_ids[len(sorted_ids) - 1] == len(arr) - 1 {progress += 1}
+	// shrink the length of the array manually
+	(^runtime.Raw_Dynamic_Array)(arr).len -= progress
+}
+
 append_thing :: #force_inline proc(things: ^[dynamic; MAX_ENTITIES]Thing, new_thing: Thing) {
 	for maybe_deleted, i in things {
 		if .Deleted in maybe_deleted.tags {
@@ -86,12 +129,15 @@ append_thing :: #force_inline proc(things: ^[dynamic; MAX_ENTITIES]Thing, new_th
 }
 delete_thing :: #force_inline proc(
 	things: ^[dynamic; MAX_ENTITIES]Thing,
-	thing_idx: int,
+	thing_handle: Thing_handle,
 ) -> Thing {
-	old_thing := &things[thing_idx]
+	old_thing := &things[thing_handle.idx]
+
+	// return nil if gen doesn't match
+	if old_thing.gen != thing_handle.gen {return {}}
+
 	if .Static not_in old_thing.traits && .Deleted not_in old_thing.tags {
 		old_thing.tags += {.Deleted}
-		gen_source -= 1
 	}
 
 	return old_thing^
@@ -125,12 +171,13 @@ rectangle_collision_check :: #force_inline proc(rect1, rect2: rl.Rectangle) -> b
 
 NewThing :: #force_inline proc(
 	_gen: int = 0,
+	$type: Thing_types,
 	pos: rl.Vector2 = {},
 	size: rl.Vector2 = {},
 	pivot: rl.Vector2 = {},
 	angle: f32 = 0,
 	color: rl.Color = {},
-	traits: bit_set[Thing_traits],
+	$traits: bit_set[Thing_traits],
 	tags: bit_set[Thing_tags] = {},
 
 	// Trait specific fields
@@ -143,16 +190,23 @@ NewThing :: #force_inline proc(
 	flipped: bool = {},
 
 	//	// Capturable
-	parent_id: Thing_idx = 0,
+	parent_handle: Thing_handle = {},
 
 	//	// Capturing
-	captures: [dynamic]Thing_idx = nil,
+	captures: [dynamic]Thing_handle = nil,
+
+	//	// Gage-like
+	gage_zone: rl.Rectangle = {}, // it's relative to pos
+	loc := #caller_location,
 ) -> Thing {
 	gen := gen_source
 	gen_source += 1
 
+	when .Gage_like in traits {fmt.assertf(gage_zone != {}, "Gage zone must be non-zero", loc = loc)}
+
 	return Thing {
 		gen,
+		type,
 		pos,
 		size,
 		pivot,
@@ -164,8 +218,9 @@ NewThing :: #force_inline proc(
 		crop,
 		back_texture,
 		flipped,
-		parent_id,
+		parent_handle,
 		captures,
+		gage_zone,
 	}
 }
 
@@ -173,8 +228,10 @@ NewCard :: #force_inline proc(
 	pos: rl.Vector2,
 	texture, back_texture: rl.Texture,
 	color: rl.Color,
+	loc := #caller_location,
 ) -> Thing {
 	return NewThing(
+		type = .Rectangle,
 		pos = pos,
 		size = CARD_SIZE,
 		crop = {0, 0, **cast([2]f32)[2]i32{texture.width, texture.height}},
@@ -183,13 +240,14 @@ NewCard :: #force_inline proc(
 		back_texture = back_texture,
 		color = rl.WHITE,
 		pivot = CARD_SIZE / 2,
+		loc = loc,
 	)
 }
 
 
 main :: proc() {
 
-	// setup game
+	// #setup game
 	{
 		// setup raylib
 		rl.InitWindow((**VSCREEN_SIZE), "game")
@@ -221,38 +279,35 @@ main :: proc() {
 
 
 			append_elem(&loaded_textures, curr_texture)
-			fmt.println(
-				file_entry.name,
-				"Texture succesfully loaded at",
-				len(loaded_textures[:]) - 1,
-			)
 
 		}
 
 		// sentinel thing
-		append(&things, NewThing(traits = {}))
+		append(&things, NewThing(type = .None, traits = {}))
 
-		mouse_thing := NewThing(traits = {.Is_Mouse, .Static})
-		assert(mouse_thing.gen == 1)
+		mouse_thing := NewThing(type = .Mouse, traits = {.Static})
 		// add player hand zone
+		hand_pos := rl.Vector2 {
+			(f32(VSCREEN_SIZE.x) - PLAYER_HAND_SIZE.x) / 2,
+			+f32(VSCREEN_SIZE.y) - PLAYER_HAND_SIZE.y,
+		}
 		hand_thing := NewThing(
-			pos = {
-				(f32(VSCREEN_SIZE.x) - PLAYER_HAND_SIZE.x) / 2,
-				+f32(VSCREEN_SIZE.y) - PLAYER_HAND_SIZE.y,
-			},
+			type = .Rectangle,
+			pos = hand_pos,
 			size = PLAYER_HAND_SIZE,
 			color = rl.DARKBLUE,
-			traits = {.Rectangular, .Static, .Capturing},
+			traits = {.Static, .Capturing, .Gage_like},
+			gage_zone = {(**hand_pos), (**PLAYER_HAND_SIZE)},
 		)
-		mouse_thing_id = len(things)
+		mouse_thing_handle.idx = len(things)
+		mouse_thing_handle.gen = mouse_thing.gen
 		append_thing(&things, mouse_thing)
 		append_thing(&things, hand_thing)
-
 
 	}
 
 	for !rl.WindowShouldClose() {
-		// collect input
+		// #collect input
 		{
 			input.vmouse_pos = rl.Vector2{virtual_screen_mouse_pos()}
 			input.mouse_delta = rl.GetMouseDelta()
@@ -268,7 +323,7 @@ main :: proc() {
 		}
 
 
-		// update state by input
+		// #update state by input
 		{
 			// draw a card from "deck"
 			if input.space_click {
@@ -280,7 +335,6 @@ main :: proc() {
 					back_texture = back_texture,
 					color = rl.WHITE,
 				)
-				new_thing.pivot = CARD_SIZE / 2
 
 				append_thing(&things, new_thing)
 				fmt.println("new thing added")
@@ -305,27 +359,29 @@ main :: proc() {
 
 			// update each thing by input
 			mouse := &things[1]
+			assert(mouse.type == .Mouse)
 			#reverse for &thing, id in things {
 				if .Deleted in thing.tags {continue}
 
 				// reset tags
 				thing.tags = {}
+				thing_handle := Thing_handle{thing.gen, id}
 
 				// check mouse collision
 				if rl.CheckCollisionPointRec(input.vmouse_pos, {**thing.pos, **thing.size}) {
 					if input.left_click && .Capturable in thing.traits {
 						if len(mouse.captures) == 0 {
-							thing.parent_id = mouse_thing_id
-							append(&mouse.captures, id)
-						} else if id == mouse.captures[0] {
+							thing.parent_handle = mouse_thing_handle
+							append(&mouse.captures, Thing_handle{thing.gen, id})
+						} else if thing_handle == mouse.captures[0] {
 							// un-capture it
-							captured_id := mouse.captures[0]
-							things[captured_id].parent_id = 0
+							captured_handle := mouse.captures[0]
+							things[captured_handle.idx].parent_handle = {}
 							clear(&mouse.captures)
 						}
 					}
 					if input.right_click {
-						delete_thing(&things, id)
+						delete_thing(&things, thing_handle)
 					}
 
 					if .Flippable in thing.traits && input.f_click {
@@ -337,114 +393,175 @@ main :: proc() {
 			}
 		}
 
-		// progress the state
+		// #progress the state
 		{
 			// update mouse in particular
 			{
-				thing := things[mouse_thing_id]
+				thing := things[mouse_thing_handle.idx]
 				if len(thing.captures) == 1 {
-					moused_thing_id := thing.captures[0]
-					moused_thing := &things[moused_thing_id]
+					moused_thing_handle := thing.captures[0]
+					moused_thing := &things[moused_thing_handle.idx]
 					moused_thing.pos = input.vmouse_pos - moused_thing.pivot
 					moused_thing.tags += {.Captured}
 				}
 			}
+
 			// for collisions
-			@(static) capturing_things: [dynamic]Thing_idx
-			@(static) capturable_things: [dynamic]Thing_idx
+			@(static) capturing_things: [dynamic]Thing_handle
+			@(static) capturable_things: [dynamic]Thing_handle
 			defer clear(&capturing_things)
 			defer clear(&capturable_things)
 			#reverse for &thing, idx in things {
-				if .Capturable in thing.traits do if .Captured not_in thing.tags {
-					append(&capturable_things, idx)
+				thing_handle := Thing_handle{thing.gen, idx}
+				if .Capturable in thing.traits &&
+				   .Captured not_in thing.tags {append(&capturable_things, thing_handle)}
+
+				if .Capturing in thing.traits {append(&capturing_things, thing_handle)}
+			}
+
+			// Iterate and update the state of the things captured by capturables
+			for capt_handle in capturing_things {
+				capt_thing := &things[capt_handle.idx]
+
+				tbr: [dynamic]int // list of things to be removed from captures
+				for thing_handle, i in capt_thing.captures {
+					thing := &things[thing_handle.idx]
+					if thing.parent_handle != capt_handle {
+						append(&tbr, i)
+						continue
+					}
+					if .Deleted in thing.tags {
+						append(&tbr, i)
+						continue
+					}
+					// check if it's still coliding
+					if rectangle_collision_check(
+						{**capt_thing.pos, **capt_thing.size},
+						{**thing.pos, **thing.size},
+					) {
+						thing.tags += {.Hidden, .Captured}
+					} else {
+						// it's possible it's captured by something else
+						append(&tbr, i)
+					}
+
 				}
-				if .Capturing in thing.traits {
-					append(&capturing_things, idx)
+
+				if len(tbr) > 0 {
+					fmt.printfln("%v before removing %v", capt_thing.captures, tbr)
+					ordered_remove_sorted_indexes_dynamic_array(&capt_thing.captures, tbr[:])
+					fmt.printfln(
+						"removing %v from capt %v, %v",
+						tbr,
+						capt_handle,
+						capt_thing.captures[:],
+					)
 				}
 			}
 
-			for thing_id in capturable_things {
-				for capt_id in capturing_things {
-					capt := &things[capt_id]
-					thing := &things[thing_id]
+			for thing_handle in capturable_things {
+				for capt_handle in capturing_things {
+					capt := &things[capt_handle.idx]
+					thing := &things[thing_handle.idx]
 
+					if .Captured in thing.tags {continue}
 
 					if rectangle_collision_check(
 						{**capt.pos, **capt.size},
 						{**thing.pos, **thing.size},
 					) {
-						thing.tags += {.Hidden}
-						append(&capt.captures, thing_id)
+						thing.tags += {.Hidden, .Captured}
+						thing.parent_handle = capt_handle
+						fmt.printfln("%v captured %v", capt_handle, thing_handle)
+						append(&capt.captures, thing_handle)
 					}
 
 				}
 			}
+
 		}
 
 
-		// drawing on virtual_screen
+		// #drawing on virtual_screen
 		if virtual_screen_draw() {
 			rl.DrawText("Hello world", 0, 0, 69, rl.RED)
 
-			for thing in things {
-				if .Deleted in thing.tags {continue}
+			for thing, id in things {
+				thing_handle := Thing_handle{thing.gen, id}
 
+				if .Deleted in thing.tags {continue}
 				if .Hidden in thing.tags {continue}
 
-				if .Textured in thing.traits {
-					dest_rect := rl.Rectangle{(**(thing.pos + thing.pivot)), (**thing.size)}
-					crop_rect: rl.Rectangle
-					color: rl.Color = thing.color
-
-					if thing.crop == {} {crop_rect = rl.Rectangle{0, 0, (**(thing.size / 2))}
-					} else {crop_rect = thing.crop}
-
-					texture := thing.texture
-
-					if .Flippable in thing.traits && thing.flipped {
-						texture = thing.back_texture
-					}
-
-					// TODO: implement Mouse as a Thing
-					if .Capturable in thing.traits && thing.parent_id == mouse_thing_id {
-						color = rl.RED
-					}
-
-					rl.DrawTexturePro(
-						texture = texture,
-						source = crop_rect,
-						dest = dest_rect,
-						origin = thing.pivot,
-						rotation = thing.angle,
-						tint = color,
-					)
-					dest_rect = rl.Rectangle{(**(thing.pos)), (**thing.size)}
-
-				}
-
-				if .Rectangular in thing.traits {
-					rl.DrawRectangle(
-						(**cast([2]i32)thing.pos),
-						(**cast([2]i32)thing.size),
-						thing.color,
-					)
-				}
-
-				if .Highlighted in thing.tags {
-					dest_rect := rl.Rectangle{(**(thing.pos)), (**thing.size)}
-					rl.DrawRectangleLinesEx(rec = dest_rect, lineThick = 5, color = rl.BLUE)
-				}
-
+				draw_thing(thing_handle)
 			}
 		}
 
-		// rendering
+		// #rendering
 		{
 			rl.BeginDrawing()
 			defer rl.EndDrawing()
 			rl.ClearBackground(rl.BLACK)
 
 			virtual_screen_render()
+		}
+	}
+
+}
+
+draw_thing :: proc(handle: Thing_handle) {
+	thing := things[handle.idx]
+	switch thing.type {
+	case .None:
+	case .Mouse:
+	case .Rectangle:
+		if .Textured in thing.traits {
+			dest_rect := rl.Rectangle{(**(thing.pos + thing.pivot)), (**thing.size)}
+			crop_rect: rl.Rectangle
+			color: rl.Color = thing.color
+
+			if thing.crop == {} {crop_rect = rl.Rectangle{0, 0, (**(thing.size / 2))}
+			} else {crop_rect = thing.crop}
+
+			texture := thing.texture
+
+			if .Flippable in thing.traits && thing.flipped {
+				texture = thing.back_texture
+			}
+
+			if .Capturable in thing.traits && thing.parent_handle == mouse_thing_handle {
+				color = rl.RED
+			}
+
+			rl.DrawTexturePro(
+				texture = texture,
+				source = crop_rect,
+				dest = dest_rect,
+				origin = thing.pivot,
+				rotation = thing.angle,
+				tint = color,
+			)
+			dest_rect = rl.Rectangle{(**(thing.pos)), (**thing.size)}
+
+		} else {
+			rl.DrawRectangle((**cast([2]i32)thing.pos), (**cast([2]i32)thing.size), thing.color)
+		}
+
+		if .Highlighted in thing.tags {
+			dest_rect := rl.Rectangle{(**(thing.pos)), (**thing.size)}
+			rl.DrawRectangleLinesEx(rec = dest_rect, lineThick = 5, color = rl.BLUE)
+		}
+
+		if .Capturing in thing.traits {
+			if .Gage_like in thing.traits {
+				for captured_thing_handle in thing.captures {
+					captured_thing := things[captured_thing_handle.idx]
+					if captured_thing.parent_handle != handle {continue}
+					draw_thing(captured_thing_handle)
+				}
+
+				return
+			}
+			// else idk, don't draw the thing
 		}
 	}
 
