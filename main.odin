@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:math/rand"
+import "core:os"
 import "core:slice"
 import "core:sort"
 import "core:strings"
@@ -36,8 +37,8 @@ Thing_tags :: enum {
 	Hidden,
 }
 Thing_handle :: struct {
-	idx: int,
 	gen: int,
+	idx: int,
 }
 Thing :: struct {
 	// generic fields
@@ -79,7 +80,6 @@ input: struct {
 	num_click:                                                         bool,
 }
 things: [dynamic; MAX_ENTITIES]Thing
-gen_source := 0
 mouse_thing_handle: Thing_handle
 
 // @assets
@@ -88,6 +88,53 @@ loaded_textures: [dynamic]rl.Texture
 back_texture: rl.Texture
 
 // @helper functions
+get_thing :: #force_inline proc(handle: Thing_handle) -> (t: ^Thing) #no_bounds_check {
+	t = &things[0]
+	if things[handle.idx].gen == handle.gen {t = &things[handle.idx]} else {
+		fmt.println("Returned 0 lol")
+	}
+
+	return
+}
+
+cleanup_thing :: proc(handle: Thing_handle) {
+	thing := get_thing(handle)
+
+	if thing.captures != nil {
+		delete(thing.captures)
+		thing.captures = nil
+	}
+
+}
+
+reverse_iter_handles :: proc(arr: []Thing) -> (h: Thing_handle, ok: bool) {
+	@(static) counter: int
+	counter += 1
+	if counter > len(arr) {
+		counter = 0
+		return
+	}
+	ok = true
+	h.idx = len(arr) - counter
+	h.gen = arr[h.idx].gen
+
+	return
+}
+
+iter_handles :: proc(arr: []Thing) -> (h: Thing_handle, ok: bool) {
+	@(static) counter: int
+	counter += 1
+	if counter > len(arr) {
+		counter = 0
+		return
+	}
+	ok = true
+	h.idx = counter - 1
+	h.gen = arr[h.idx].gen
+
+	return
+}
+
 ordered_remove_sorted_indexes_dynamic_array :: #force_inline proc(
 	#no_alias arr: ^$T/[dynamic]$E,
 	sorted_ids: []int,
@@ -95,8 +142,13 @@ ordered_remove_sorted_indexes_dynamic_array :: #force_inline proc(
 ) #no_bounds_check {
 	progress := 0
 	initial_len := len(arr)
+	ids_len := len(sorted_ids)
+	prev_id := -1
 
-	assert(slice.is_sorted(sorted_ids), loc = loc)
+	//
+	if ids_len == 0 do return
+
+	// manual bounds checks
 	assert(sorted_ids[len(sorted_ids) - 1] < len(arr), loc = loc)
 	assert(sorted_ids[0] >= 0, loc = loc)
 
@@ -105,7 +157,14 @@ ordered_remove_sorted_indexes_dynamic_array :: #force_inline proc(
 		// calculate how far back the empty slot is
 		if el_i - 1 == sorted_ids[progress] {
 			progress += 1
-			assert(sorted_ids[progress] != sorted_ids[progress + 1])
+
+			// this covers both duplicates and unsorted arrays
+			fmt.assertf(
+				prev_id < sorted_ids[progress],
+				"sorted_ids must be strictly ascending: %v",
+				sorted_ids,
+			)
+			prev_id = sorted_ids[progress] // using a value rather then sorted_ids[progress +- 1] sidesteps the case where len ==1
 		}
 
 		// pull back the element to the now empty slot
@@ -117,27 +176,35 @@ ordered_remove_sorted_indexes_dynamic_array :: #force_inline proc(
 	(^runtime.Raw_Dynamic_Array)(arr).len -= progress
 }
 
-append_thing :: #force_inline proc(things: ^[dynamic; MAX_ENTITIES]Thing, new_thing: Thing) {
-	for maybe_deleted, i in things {
-		if .Deleted in maybe_deleted.tags {
-			things[i] = new_thing
+append_thing :: #force_inline proc(
+	things: ^[dynamic; MAX_ENTITIES]Thing,
+	new_thing: Thing,
+) -> (
+	new_handle: Thing_handle,
+) {
+	for maybe_handle in iter_handles(things[:]) {
+		if .Deleted in get_thing(maybe_handle).tags {
+			delete_thing(maybe_handle)
+			new_handle = maybe_handle
+			things[maybe_handle.idx] = new_thing
+			things[maybe_handle.idx].gen += 1
+			new_handle.gen += 1
 			return
 		}
 	}
 
+	new_handle.idx = len(things)
 	append(things, new_thing)
-}
-delete_thing :: #force_inline proc(
-	things: ^[dynamic; MAX_ENTITIES]Thing,
-	thing_handle: Thing_handle,
-) -> Thing {
-	old_thing := &things[thing_handle.idx]
 
-	// return nil if gen doesn't match
-	if old_thing.gen != thing_handle.gen {return {}}
+	return
+}
+delete_thing :: #force_inline proc(thing_handle: Thing_handle) -> Thing {
+	old_thing := get_thing(thing_handle)
 
 	if .Static not_in old_thing.traits && .Deleted not_in old_thing.tags {
 		old_thing.tags += {.Deleted}
+	} else {
+		fmt.println("Deleted deleted or static thing")
 	}
 
 	return old_thing^
@@ -199,13 +266,11 @@ NewThing :: #force_inline proc(
 	gage_zone: rl.Rectangle = {}, // it's relative to pos
 	loc := #caller_location,
 ) -> Thing {
-	gen := gen_source
-	gen_source += 1
 
 	when .Gage_like in traits {fmt.assertf(gage_zone != {}, "Gage zone must be non-zero", loc = loc)}
 
 	return Thing {
-		gen,
+		0,
 		type,
 		pos,
 		size,
@@ -283,7 +348,7 @@ main :: proc() {
 		}
 
 		// sentinel thing
-		append(&things, NewThing(type = .None, traits = {}))
+		append(&things, NewThing(type = .None, traits = {.Static}))
 
 		mouse_thing := NewThing(type = .Mouse, traits = {.Static})
 		// add player hand zone
@@ -306,6 +371,7 @@ main :: proc() {
 
 	}
 
+
 	for !rl.WindowShouldClose() {
 		// #collect input
 		{
@@ -320,6 +386,96 @@ main :: proc() {
 			input.space_click = rl.IsKeyPressed(.SPACE)
 
 			input.numeric_in, input.num_click = get_digit_pressed()
+		}
+
+		// #progress the state
+		{
+			// update mouse in particular
+			{
+				thing := get_thing(mouse_thing_handle)
+				if len(thing.captures) == 1 {
+					moused_thing_handle := thing.captures[0]
+					moused_thing := get_thing(moused_thing_handle)
+					moused_thing.pos = input.vmouse_pos - moused_thing.pivot
+					moused_thing.tags += {.Captured}
+					if .Deleted in moused_thing.tags {
+						cleanup_thing(moused_thing_handle)
+						ordered_remove(&thing.captures, 0)
+					}
+				}
+			}
+
+			// for collisions
+			@(static) capturing_things: [dynamic]Thing_handle
+			@(static) capturable_things: [dynamic]Thing_handle
+			defer clear(&capturing_things)
+			defer clear(&capturable_things)
+
+			for thing_handle in reverse_iter_handles(things[:]) {
+				thing := get_thing(thing_handle)
+				if .Deleted in thing.tags {
+					cleanup_thing(thing_handle)
+					continue
+				}
+
+
+				if .Capturable in thing.traits &&
+				   .Captured not_in thing.tags {append(&capturable_things, thing_handle)}
+
+				if .Capturing in thing.traits {append(&capturing_things, thing_handle)}
+			}
+
+			// Iterate and update the state of the things captured by capturables
+			for capt_handle in capturing_things {
+				capt_thing := get_thing(capt_handle)
+
+				tbr: [dynamic]int // list of things to be removed from captures
+				for thing_handle, i in capt_thing.captures {
+					thing := get_thing(thing_handle)
+					if thing.parent_handle != capt_handle {
+						append(&tbr, i)
+						continue
+					}
+					if .Deleted in thing.tags {
+						append(&tbr, i)
+						continue
+					}
+					// check if it's still coliding
+					if rectangle_collision_check(
+						{**capt_thing.pos, **capt_thing.size},
+						{**thing.pos, **thing.size},
+					) {
+						thing.tags += {.Hidden, .Captured}
+					} else {
+						// it's possible it's captured by something else
+						append(&tbr, i)
+					}
+
+				}
+
+				if len(tbr) >
+				   0 {ordered_remove_sorted_indexes_dynamic_array(&capt_thing.captures, tbr[:])}
+			}
+
+			for thing_handle in capturable_things {
+				for capt_handle in capturing_things {
+					capt := get_thing(capt_handle)
+					thing := get_thing(thing_handle)
+
+					if .Captured in thing.tags {continue}
+
+					if rectangle_collision_check(
+						{**capt.pos, **capt.size},
+						{**thing.pos, **thing.size},
+					) {
+						thing.tags += {.Hidden, .Captured}
+						thing.parent_handle = capt_handle
+						append(&capt.captures, thing_handle)
+					}
+
+				}
+			}
+
 		}
 
 
@@ -350,7 +506,6 @@ main :: proc() {
 						back_texture = back_texture,
 						color = rl.WHITE,
 					)
-					new_thing.pivot = CARD_SIZE / 2
 
 					append_thing(&things, new_thing)
 				}
@@ -360,28 +515,30 @@ main :: proc() {
 			// update each thing by input
 			mouse := &things[1]
 			assert(mouse.type == .Mouse)
-			#reverse for &thing, id in things {
+			for thing_handle in reverse_iter_handles(things[:]) {
+				thing := get_thing(thing_handle)
 				if .Deleted in thing.tags {continue}
 
-				// reset tags
 				thing.tags = {}
-				thing_handle := Thing_handle{thing.gen, id}
+
+				// reset tags
 
 				// check mouse collision
 				if rl.CheckCollisionPointRec(input.vmouse_pos, {**thing.pos, **thing.size}) {
 					if input.left_click && .Capturable in thing.traits {
 						if len(mouse.captures) == 0 {
 							thing.parent_handle = mouse_thing_handle
-							append(&mouse.captures, Thing_handle{thing.gen, id})
+							append(&mouse.captures, thing_handle)
 						} else if thing_handle == mouse.captures[0] {
 							// un-capture it
 							captured_handle := mouse.captures[0]
-							things[captured_handle.idx].parent_handle = {}
+							get_thing(captured_handle).parent_handle = {}
 							clear(&mouse.captures)
 						}
 					}
 					if input.right_click {
-						delete_thing(&things, thing_handle)
+						fmt.println("delete it")
+						delete_thing(thing_handle)
 					}
 
 					if .Flippable in thing.traits && input.f_click {
@@ -393,101 +550,13 @@ main :: proc() {
 			}
 		}
 
-		// #progress the state
-		{
-			// update mouse in particular
-			{
-				thing := things[mouse_thing_handle.idx]
-				if len(thing.captures) == 1 {
-					moused_thing_handle := thing.captures[0]
-					moused_thing := &things[moused_thing_handle.idx]
-					moused_thing.pos = input.vmouse_pos - moused_thing.pivot
-					moused_thing.tags += {.Captured}
-				}
-			}
-
-			// for collisions
-			@(static) capturing_things: [dynamic]Thing_handle
-			@(static) capturable_things: [dynamic]Thing_handle
-			defer clear(&capturing_things)
-			defer clear(&capturable_things)
-			#reverse for &thing, idx in things {
-				thing_handle := Thing_handle{thing.gen, idx}
-				if .Capturable in thing.traits &&
-				   .Captured not_in thing.tags {append(&capturable_things, thing_handle)}
-
-				if .Capturing in thing.traits {append(&capturing_things, thing_handle)}
-			}
-
-			// Iterate and update the state of the things captured by capturables
-			for capt_handle in capturing_things {
-				capt_thing := &things[capt_handle.idx]
-
-				tbr: [dynamic]int // list of things to be removed from captures
-				for thing_handle, i in capt_thing.captures {
-					thing := &things[thing_handle.idx]
-					if thing.parent_handle != capt_handle {
-						append(&tbr, i)
-						continue
-					}
-					if .Deleted in thing.tags {
-						append(&tbr, i)
-						continue
-					}
-					// check if it's still coliding
-					if rectangle_collision_check(
-						{**capt_thing.pos, **capt_thing.size},
-						{**thing.pos, **thing.size},
-					) {
-						thing.tags += {.Hidden, .Captured}
-					} else {
-						// it's possible it's captured by something else
-						append(&tbr, i)
-					}
-
-				}
-
-				if len(tbr) > 0 {
-					fmt.printfln("%v before removing %v", capt_thing.captures, tbr)
-					ordered_remove_sorted_indexes_dynamic_array(&capt_thing.captures, tbr[:])
-					fmt.printfln(
-						"removing %v from capt %v, %v",
-						tbr,
-						capt_handle,
-						capt_thing.captures[:],
-					)
-				}
-			}
-
-			for thing_handle in capturable_things {
-				for capt_handle in capturing_things {
-					capt := &things[capt_handle.idx]
-					thing := &things[thing_handle.idx]
-
-					if .Captured in thing.tags {continue}
-
-					if rectangle_collision_check(
-						{**capt.pos, **capt.size},
-						{**thing.pos, **thing.size},
-					) {
-						thing.tags += {.Hidden, .Captured}
-						thing.parent_handle = capt_handle
-						fmt.printfln("%v captured %v", capt_handle, thing_handle)
-						append(&capt.captures, thing_handle)
-					}
-
-				}
-			}
-
-		}
-
 
 		// #drawing on virtual_screen
 		if virtual_screen_draw() {
 			rl.DrawText("Hello world", 0, 0, 69, rl.RED)
 
-			for thing, id in things {
-				thing_handle := Thing_handle{thing.gen, id}
+			for thing_handle in iter_handles(things[:]) {
+				thing := get_thing(thing_handle)
 
 				if .Deleted in thing.tags {continue}
 				if .Hidden in thing.tags {continue}
@@ -540,7 +609,7 @@ draw_thing :: proc(handle: Thing_handle) {
 				rotation = thing.angle,
 				tint = color,
 			)
-			dest_rect = rl.Rectangle{(**(thing.pos)), (**thing.size)}
+			// dest_rect = rl.Rectangle{(**(thing.pos)), (**thing.size)}
 
 		} else {
 			rl.DrawRectangle((**cast([2]i32)thing.pos), (**cast([2]i32)thing.size), thing.color)
@@ -554,7 +623,7 @@ draw_thing :: proc(handle: Thing_handle) {
 		if .Capturing in thing.traits {
 			if .Gage_like in thing.traits {
 				for captured_thing_handle in thing.captures {
-					captured_thing := things[captured_thing_handle.idx]
+					captured_thing := get_thing(captured_thing_handle)
 					if captured_thing.parent_handle != handle {continue}
 					draw_thing(captured_thing_handle)
 				}
