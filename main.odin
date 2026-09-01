@@ -2,10 +2,15 @@ package main
 
 import "base:runtime"
 import cl "clay-odin"
+import "core:bytes"
 import "core:c"
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:strings"
+import win32 "core:sys/windows"
+import "core:unicode/utf16"
+
 import rl "vendor:raylib"
 
 audex_font_data := #load("./assets/fonts/Inter_24pt-Bold.ttf")
@@ -18,6 +23,9 @@ ON_EXIT_CLEANUP :: #config(ON_EXIT_CLEANUP, false)
 $ - broad global sections
 # - local sections
 */
+
+MAX_CARDS :: 500
+MAX_PLAYERS :: 4
 
 // $main loop
 SCREEN_WIDTH :: 1600
@@ -33,15 +41,16 @@ Game :: struct {
 	app_state:       AppState,
 	debug_mode:      bool,
 	running:         bool,
-	players:         [dynamic; 4]Player,
-	loaded_textures: [dynamic; 200]rl.Texture,
+	gamestate:       Gamestate,
+	players:         [dynamic; MAX_PLAYERS]Player,
+	loaded_textures: [dynamic; MAX_CARDS]rl.Texture,
 }
 
 main :: proc() {
 	rl.InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "AppState")
 	rl.SetTargetFPS(60)
-	when ON_EXIT_CLEANUP {
-		defer rl.CloseWindow()
+	when ON_EXIT_CLEANUP do defer {
+		rl.CloseWindow()
 	}
 
 
@@ -50,108 +59,167 @@ main :: proc() {
 	game.running = true
 	cl.SetDebugModeEnabled(true)
 
-	for !rl.WindowShouldClose() && game.running {
-		// #ui prelude
-		{
-			cl.SetPointerState(cast([2]f32)rl.GetMousePosition(), rl.IsMouseButtonDown(.LEFT))
-			cl.SetLayoutDimensions({SCREEN_WIDTH, SCREEN_HEIGHT})
-			cl.BeginLayout()
+	window_container := cl.ElementDeclaration {
+		id = cl.ID("WindowContainer"),
+		layout = {
+			sizing = {cl.SizingGrow({}), cl.SizingGrow({})},
+			childAlignment = {x = .Center, y = .Center},
+		},
+	}
+	screen_container := cl.ElementDeclaration {
+		id = cl.ID("ScreenContainer"),
+		layout = {
+			layoutDirection = .TopToBottom,
+			sizing = {cl.SizingGrow({0, 0}), cl.SizingGrow({0, 0})},
+			childAlignment = {x = .Center, y = .Center},
+			padding = cl.PaddingAll(30),
+			childGap = 30,
+		},
+	}
 
-			if rl.IsKeyPressed(.D) {
-				@(static) prev: bool
-				prev = cl.IsDebugModeEnabled()
-				prev = !prev
-				cl.SetDebugModeEnabled(prev)
+	app_loop: for {
+		switch game.app_state {
+		case .startup:
+			// #init game
+			{
+				img := rl.LoadImageFromMemory(
+					".png",
+					raw_data(no_texture_texture_image),
+					auto_cast len(no_texture_texture_image),
+				)
+				defer rl.UnloadImage(img)
+				tex := rl.LoadTextureFromImage(img)
+				if !rl.IsTextureValid(tex) {
+					fmt.panicf("Invalid texture for no-tex")
+				}
+
+				for !rl.IsTextureReady(tex) {}
+
+				append(&game.loaded_textures, tex)
 			}
-		}
-
-		// #progress game
-		{
-			window_container := cl.ElementDeclaration {
-				id = cl.ID("WindowContainer"),
-				layout = {
-					sizing = {cl.SizingGrow({}), cl.SizingGrow({})},
-					childAlignment = {x = .Center, y = .Center},
-				},
-			}
-			screen_container := cl.ElementDeclaration {
-				id = cl.ID("ScreenContainer"),
-				layout = {
-					layoutDirection = .TopToBottom,
-					sizing = {cl.SizingGrow({0, 0}), cl.SizingGrow({0, 0})},
-					childAlignment = {x = .Center, y = .Center},
-					padding = cl.PaddingAll(3),
-					childGap = 3,
-				},
+			game.app_state = .mainmenu
+		case .mainmenu:
+			// initialisation
+			{
 			}
 
+			// state loop
+			for !rl.WindowShouldClose() && game.running && game.app_state == .mainmenu {
+				cl.SetPointerState(cast([2]f32)rl.GetMousePosition(), rl.IsMouseButtonDown(.LEFT))
+				cl.SetLayoutDimensions({SCREEN_WIDTH, SCREEN_HEIGHT})
+				cl.BeginLayout()
 
-			if cl.UI()(window_container) {
+				if rl.IsKeyPressed(.D) {
+					@(static) prev: bool
+					prev = cl.IsDebugModeEnabled()
+					prev = !prev
+					cl.SetDebugModeEnabled(prev)
+				}
 
-				switch game.app_state {
-				case .startup:
-					// #init game
-					{
-						img := rl.LoadImageFromMemory(
-							".png",
-							raw_data(no_texture_texture_image),
-							auto_cast len(no_texture_texture_image),
-						)
-						defer rl.UnloadImage(img)
-						tex := rl.LoadTextureFromImage(img)
-						if !rl.IsTextureValid(tex) {
-							fmt.panicf("Invalid texture for no-tex")
-						}
-
-						for !rl.IsTextureReady(tex) {}
-
-						append(&game.loaded_textures, tex)
-					}
-					game.app_state = .mainmenu
-				case .mainmenu:
+				if cl.UI()(window_container) {
 					cl.UI()(screen_container)
 
-					hovered_play := static_button_elem("Play", {})
-					hovered_exit := static_button_elem("Exit", {})
+					hovered_play := static_button_elem("Play", BUTTON_SIZE)
+					hovered_exit := static_button_elem("Exit", BUTTON_SIZE)
 					if hovered_play && rl.IsMouseButtonDown(.LEFT) {
 						game.app_state = .gameplay
 					}
 					if hovered_exit && rl.IsMouseButtonDown(.LEFT) {
 						game.app_state = .exit
 					}
-				case .gameplay:
-					TODO("Implement gameplay")
-				case .exit:
-					game.running = false
-					when ON_EXIT_CLEANUP {
-						for tex in game.loaded_textures {
-							rl.UnloadTexture(tex)
-						}
-					}
+				}
+
+				// #render on the screen
+				{
+					local_comms := cl.EndLayout()
+
+					rl.BeginDrawing()
+					rl.ClearBackground(rl.BLACK)
+
+					rl.DrawFPS(0, 0)
+
+					clay_raylib_render(&local_comms)
+
+					rl.EndDrawing()
+				}
+
+			}
+
+			// deinitialisation
+			{
+
+			}
+			// after the app_state loop
+			TODO("After the appstate of mainmenu")
+
+		case .gameplay:
+			// when moving to this state
+			files: []string
+			when ON_EXIT_CLEANUP do defer {
+				for path_string in files {
+					free(string)
+				}
+				delete(files)
+			}
+
+			// initialisation
+			{
+				fmt.println("gameplay initialised")
+				err: os.Error
+				files, err = open_file_dialog()
+				if err == nil {
+					fmt.println(files)
 				}
 			}
-		}
 
+			// app_state loop
+			for !rl.WindowShouldClose() && game.running {
+				// free temp per frame
+				defer free_all(context.temp_allocator)
 
-		// #render game on the screen
-		{
-			local_comms := cl.EndLayout()
+				switched: bool
+				cl.SetPointerState(cast([2]f32)rl.GetMousePosition(), rl.IsMouseButtonDown(.LEFT))
+				cl.SetLayoutDimensions({SCREEN_WIDTH, SCREEN_HEIGHT})
+				cl.BeginLayout()
 
-			rl.BeginDrawing()
-			rl.ClearBackground(rl.BLACK)
+				if rl.IsKeyPressed(.D) {
+					@(static) prev: bool
+					prev = cl.IsDebugModeEnabled()
+					prev = !prev
+					cl.SetDebugModeEnabled(prev)
+				}
 
-			rl.DrawFPS(0, 0)
+				// #render on the screen
+				{
+					local_comms := cl.EndLayout()
 
-			switch game.app_state {
-			case .startup:
-			case .mainmenu:
-			case .gameplay:
-			case .exit:
+					rl.BeginDrawing()
+					rl.ClearBackground(rl.BLACK)
+
+					rl.DrawFPS(0, 0)
+
+					clay_raylib_render(&local_comms)
+
+					rl.EndDrawing()
+				}
+				// if it was changed, go back to the outermost loop
+				if game.app_state != .gameplay {continue app_loop}
 			}
 
-			clay_raylib_render(&local_comms)
+			// deinitialisation
+			{
+			}
+			TODO("implement gameplay")
 
-			rl.EndDrawing()
+		case .exit:
+			when ON_EXIT_CLEANUP {
+				for tex in game.loaded_textures {
+					rl.UnloadTexture(tex)
+				}
+			}
+			break app_loop
+		case:
+			panic("Unreachable")
 		}
 	}
 }
@@ -178,13 +246,21 @@ Load_cards_from_dir :: proc() {
 // $gameplay system
 
 // the representation of a player
+Card_info :: struct {
+	texture: rl.Texture,
+	// text
+	// stats
+}
+
 Player_kind :: enum {
 	Local,
 	Network,
 }
 Player :: struct {
-	kind: Player_kind,
-	addr: net.Address,
+	kind:       Player_kind,
+	name:       string,
+	addr:       net.Address,
+	card_infos: [dynamic; MAX_CARDS]Card_info,
 }
 
 Take_player_input :: proc(player: ^Player) {
@@ -211,7 +287,16 @@ Send_gs_update :: proc(gs: Gamestate, player: Player) {
 	}
 }
 // the current state of the gameplay
-Gamestate :: struct {}
+Card_data :: struct {
+	uid:       int,
+	pos, size: rl.Vector2,
+	flipped:   bool,
+	angle:     f32,
+}
+
+Gamestate :: struct {
+	cards: [dynamic; MAX_CARDS]Card_data,
+}
 
 
 // $sound system
@@ -221,6 +306,8 @@ Gamestate :: struct {}
 
 
 // $ui system
+BUTTON_SIZE :: [2]f32{100, 50}
+
 errorHandler :: proc "c" (errorData: cl.ErrorData) {
 	context = runtime.default_context()
 
@@ -298,6 +385,57 @@ button_text_config := cl.TextElementConfig {
 }
 
 // $misc
+
+open_file_dialog :: proc(allocator := context.allocator) -> (paths: []string, err: os.Error) {
+	// Needs to be large enough to hold many filenames.
+	// Bump this up further if you expect very large selections.
+	buf := make([]u16, 32768, context.temp_allocator) or_return
+
+	ofn := win32.OPENFILENAMEW {
+		lStructSize  = size_of(win32.OPENFILENAMEW),
+		lpstrFile    = cast(cstring16)raw_data(buf),
+		nMaxFile     = u32(len(buf)),
+		lpstrFilter  = win32.utf8_to_wstring("All Files\x00*.*\x00"),
+		nFilterIndex = 1,
+		Flags        = win32.OFN_PATHMUSTEXIST | win32.OFN_FILEMUSTEXIST | win32.OFN_ALLOWMULTISELECT | win32.OFN_EXPLORER,
+	}
+
+	if !win32.GetOpenFileNameW(&ofn) {
+		err = .Unknown
+		return
+	}
+
+	// parse the outputed bytes to utf8 format
+	strings_data := make([]u8, (len(buf)), context.temp_allocator)
+	utf16.decode_to_utf8(strings_data, buf)
+	trimmed_str_bytes := bytes.trim(strings_data, {0})
+
+	str_builder, str_builder_reset: strings.Builder
+	strings.builder_init(&str_builder, context.temp_allocator)
+
+	// first string from GetOpenFileNameW is the root path
+	root_path, _ := bytes.split_iterator(&trimmed_str_bytes, []u8{0})
+	strings.write_bytes(&str_builder, root_path)
+	str_builder_reset = str_builder // save the reset point
+
+	dyn_paths := make([dynamic]string)
+
+	for file_name in bytes.split_iterator(&trimmed_str_bytes, []u8{0}) {
+		file_name := cast(string)file_name
+		strings.write_string(&str_builder, file_name)
+		append(&dyn_paths, strings.clone(strings.to_string(str_builder), allocator)) or_return
+		// cannot leak memory as it uses the temp allocator
+		str_builder_reset = str_builder
+	}
+	// if no other strings were read from the byte stream, the root_path is the sole file path
+	if len(dyn_paths) == 0 {
+		append(&dyn_paths, strings.clone(strings.to_string(str_builder), allocator)) or_return
+	}
+
+
+	paths = dyn_paths[:]
+	return
+}
 
 TODO :: proc($msg: string, loc := #caller_location) {
 	panic(msg, loc = loc)
